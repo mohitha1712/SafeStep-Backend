@@ -1,3 +1,4 @@
+
 from datetime import datetime, timezone
 from typing import Optional
 import sqlite3
@@ -5,6 +6,8 @@ import sqlite3
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+from surface_model import predict_surface
 
 
 DB_NAME = "safestep.db"
@@ -15,8 +18,7 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Allow the published Bolt frontend to communicate with the backend.
-# During development, allow localhost as well.
+# Allow the published Bolt frontend and local development.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -29,6 +31,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Request models
 
 class SensorData(BaseModel):
     device: str = "SafeStep"
@@ -56,6 +60,13 @@ class ContactData(BaseModel):
     notification_preference: str = "high_risk"
     active: bool = True
 
+
+class SurfacePredictionData(BaseModel):
+    moisture_raw: int = Field(ge=0)
+    moisture_percent: float = Field(ge=0, le=100)
+
+
+# Database functions
 
 def get_db():
     connection = sqlite3.connect(DB_NAME)
@@ -114,12 +125,14 @@ latest_sensor: Optional[dict] = None
 last_seen: Optional[str] = None
 
 
+# Basic routes
+
 @app.get("/")
 def root():
     return {
         "name": "SafeStep API",
         "status": "running",
-        "version": "1.0.0"
+        "version": "1.0.0",
     }
 
 
@@ -127,9 +140,12 @@ def root():
 def health():
     return {
         "status": "healthy",
-        "service": "SafeStep API"
+        "service": "SafeStep API",
     }
 
+
+# ESP32 sensor data route
+# Existing sensor and safety decisions remain unchanged.
 
 @app.post("/api/safestep")
 def receive_sensor_data(data: SensorData):
@@ -180,21 +196,23 @@ def receive_sensor_data(data: SensorData):
     return {
         "success": True,
         "message": "Sensor data received",
-        "timestamp": timestamp
+        "timestamp": timestamp,
     }
 
+
+# Existing sensor monitoring routes
 
 @app.get("/api/sensors/latest")
 def get_latest_sensor():
     if latest_sensor is None:
         return {
             "status": "NO_DATA",
-            "data": None
+            "data": None,
         }
 
     return {
         "status": "CONNECTED",
-        "data": latest_sensor
+        "data": latest_sensor,
     }
 
 
@@ -203,7 +221,7 @@ def get_current_safety():
     if latest_sensor is None:
         return {
             "status": "NO_DATA",
-            "safety": None
+            "safety": None,
         }
 
     return {
@@ -214,7 +232,7 @@ def get_current_safety():
             "hazard": latest_sensor["hazard"],
             "surface": latest_sensor["surface"],
             "obstacle": latest_sensor["obstacle"],
-        }
+        },
     }
 
 
@@ -225,14 +243,14 @@ def get_device():
             "device": "SafeStep",
             "status": "NO_DATA",
             "last_seen": None,
-            "wifi": "UNKNOWN"
+            "wifi": "UNKNOWN",
         }
 
     return {
         "device": latest_sensor["device"],
         "status": "CONNECTED",
         "last_seen": last_seen,
-        "wifi": latest_sensor["wifi"]
+        "wifi": latest_sensor["wifi"],
     }
 
 
@@ -253,9 +271,35 @@ def get_history(limit: int = 100):
 
     return {
         "count": len(rows),
-        "data": [dict(row) for row in rows]
+        "data": [dict(row) for row in rows],
     }
 
+
+# Random Forest ML prediction route
+# This route is separate from the live ESP32 safety pipeline.
+
+@app.post("/api/ml/predict-surface")
+def predict_surface_endpoint(data: SurfacePredictionData):
+    try:
+        prediction = predict_surface(
+            data.moisture_raw,
+            data.moisture_percent,
+        )
+
+        return {
+            "success": True,
+            "model": "RandomForestClassifier",
+            "prediction": prediction,
+        }
+
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
+
+
+# Trusted contacts
 
 @app.get("/api/contacts")
 def get_contacts():
@@ -271,63 +315,7 @@ def get_contacts():
 
     return {
         "count": len(rows),
-        "data": [dict(row) for row in rows]
-    }
-
-
-@app.post("/api/events")
-def create_event(event: EventData):
-    timestamp = datetime.now(timezone.utc).isoformat()
-
-    db = get_db()
-
-    cursor = db.execute("""
-        INSERT INTO events (
-            timestamp,
-            event_type,
-            description,
-            hazard
-        )
-        VALUES (?, ?, ?, ?)
-    """, (
-        timestamp,
-        event.event_type,
-        event.description,
-        event.hazard,
-    ))
-
-    db.commit()
-    event_id = cursor.lastrowid
-    db.close()
-
-    return {
-        "success": True,
-        "event_id": event_id,
-        "timestamp": timestamp
-    }
-
-
-@app.post("/api/alerts/acknowledge")
-def acknowledge_alert(event_id: int):
-    db = get_db()
-
-    exists = db.execute(
-        "SELECT id FROM events WHERE id = ?",
-        (event_id,)
-    ).fetchone()
-
-    db.close()
-
-    if exists is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Event not found"
-        )
-
-    return {
-        "success": True,
-        "message": "Alert acknowledged",
-        "event_id": event_id
+        "data": [dict(row) for row in rows],
     }
 
 
@@ -358,5 +346,63 @@ def add_contact(contact: ContactData):
 
     return {
         "success": True,
-        "contact_id": contact_id
+        "contact_id": contact_id,
+    }
+
+
+# Events and alerts
+
+@app.post("/api/events")
+def create_event(event: EventData):
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    db = get_db()
+
+    cursor = db.execute("""
+        INSERT INTO events (
+            timestamp,
+            event_type,
+            description,
+            hazard
+        )
+        VALUES (?, ?, ?, ?)
+    """, (
+        timestamp,
+        event.event_type,
+        event.description,
+        event.hazard,
+    ))
+
+    db.commit()
+    event_id = cursor.lastrowid
+    db.close()
+
+    return {
+        "success": True,
+        "event_id": event_id,
+        "timestamp": timestamp,
+    }
+
+
+@app.post("/api/alerts/acknowledge")
+def acknowledge_alert(event_id: int):
+    db = get_db()
+
+    exists = db.execute(
+        "SELECT id FROM events WHERE id = ?",
+        (event_id,),
+    ).fetchone()
+
+    db.close()
+
+    if exists is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Event not found",
+        )
+
+    return {
+        "success": True,
+        "message": "Alert acknowledged",
+        "event_id": event_id,
     }
